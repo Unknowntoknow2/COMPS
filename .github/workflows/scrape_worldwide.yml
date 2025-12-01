@@ -1,0 +1,235 @@
+name: Scrape Local Dealer SRP (robots-allowed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_url:
+        description: 'Dealer homepage or SRP URL (same domain)'
+        required: true
+        default: 'https://www.worldwideautosalesca.com/'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install scrapy==2.11.2 scrapy-playwright==0.0.32
+
+      - name: Install Playwright Chromium + deps
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Prepare workspace
+        run: |
+          mkdir -p spider out logs
+
+      - name: Save robots.txt (with UA)
+        env:
+          START_URL: ${{ github.event.inputs.start_url }}
+        run: |
+          set -e
+          host="$(python - <<'PY'
+          from urllib.parse import urlparse; import os
+          print(urlparse(os.environ["START_URL"]).netloc)
+          PY
+          )"
+          url="https://${host}/robots.txt"
+          UA="AINCOMP/1.0 (+compliance)"
+          if curl -A "$UA" -fsSL "$url" -o out/robots.txt; then
+            echo "robots.txt saved from $url"
+          else
+            echo "FETCH_FAILED" > out/robots.txt
+          fi
+
+      - name: Write spider (homepage → discover SRP → extract items; robots obeyed)
+        run: |
+          cat > spider/local_srp.py <<'PY'
+          import re, scrapy
+          from urllib.parse import urlparse, urljoin
+          from scrapy_playwright.page import PageMethod
+
+          def _num(s):
+              if not s: return None
+              m = re.search(r'[\$£€]?\s*([\d,]+(?:\.\d+)?)', s)
+              return float(m.group(1).replace(',', '')) if m else None
+
+          def _miles(s):
+              if not s: return None
+              m = re.search(r'([\d,]+)\s*(?:mi|mile|miles)\b', s.lower())
+              return int(m.group(1).replace(',', '')) if m else None
+
+          def _year(s):
+              if not s: return None
+              m = re.search(r'\b(19|20)\d{2}\b', s)
+              return int(m.group(0)) if m else None
+
+          SRP_HINTS = ("inventory","used","pre-owned","preowned","search","vehicles","browse")
+          # We do not click VDPs; we only read SRP pages the robots allow.
+          VDP_HINT = "/vehicle"  # common pattern; also catch details pages by /details or /vin
+
+          class LocalDealerSRP(scrapy.Spider):
+              name = "local_srp"
+              custom_settings = {
+                  "ROBOTSTXT_OBEY": True,
+                  "USER_AGENT": "AINCOMP/1.0 (+compliance)",
+                  "LOG_LEVEL": "INFO",
+                  "DOWNLOAD_DELAY": 0.5,
+                  "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+                  "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
+                  "DOWNLOAD_HANDLERS": {
+                      "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+                      "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
+                  },
+                  "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 30000,
+                  "PLAYWRIGHT_LAUNCH_OPTIONS": { "headless": True },
+                  "FEEDS": { "out/out.ndjson": { "format": "jsonlines", "overwrite": True } },
+              }
+
+              def __init__(self, url=None, *a, **kw):
+                  super().__init__(*a, **kw)
+                  if not url:
+                      raise ValueError("Provide -a url=https://dealer/")
+                  self.start_url = url
+                  self.host = urlparse(url).netloc
+
+              def start_requests(self):
+                  # 1) Load homepage (or supplied SRP) with JS render
+                  yield scrapy.Request(
+                      self.start_url,
+                      meta={
+                          "playwright": True,
+                          "playwright_page_methods": [
+                              PageMethod("wait_for_load_state", "networkidle"),
+                              PageMethod("screenshot", path="out/home.png", full_page=True),
+                          ],
+                      },
+                      callback=self.discover_or_extract
+                  )
+
+              def discover_or_extract(self, response):
+                  # If the start_url already looks like SRP, extract directly
+                  path = urlparse(response.url).path.lower()
+                  if any(h in path for h in SRP_HINTS):
+                      yield from self.parse_srp(response)
+                      return
+
+                  # 2) Discover internal SRP links
+                  candidates = set()
+                  for href in response.css('a::attr(href)').getall():
+                      u = urljoin(response.url, href)
+                      pu = urlparse(u)
+                      if pu.netloc != self.host:  # stay on same domain
+                          continue
+                      p = pu.path.lower()
+                      if any(h in p for h in SRP_HINTS) and VDP_HINT not in p:
+                          candidates.add(u)
+
+                  # Fetch up to 5 SRPs to avoid long runs
+                  for i, u in enumerate(sorted(candidates)):
+                      if i >= 5: break
+                      yield scrapy.Request(
+                          u,
+                          meta={
+                              "playwright": True,
+                              "playwright_page_methods": [
+                                  PageMethod("wait_for_load_state", "networkidle"),
+                                  PageMethod("wait_for_selector", "a[href*='vehicle'], a[href*='detail'], [class*='vehicle'], [class*='inventory']", state="attached", timeout=30000),
+                                  PageMethod("screenshot", path=f"out/srp_{i}.png", full_page=True),
+                              ],
+                          },
+                          callback=self.parse_srp
+                      )
+
+              def parse_srp(self, response):
+                  items = []
+                  # broad card selection; then parse the combined text
+                  cards = response.css("[class*='vehicle'], [class*='inventory'], article, li, div")
+                  for c in cards:
+                      href = c.css("a[href*='vehicle']::attr(href), a[href*='detail']::attr(href), a[href*='vin']::attr(href)").get()
+                      if not href:
+                          continue
+                      vdp_url = urljoin(response.url, href)  # NOTE: do not request VDPs unless robots allow; we just record link.
+
+                      texts = c.css("*::text, ::text").getall()
+                      full = " ".join(t.strip() for t in texts if t and t.strip())
+                      if not full:
+                          continue
+
+                      title = c.css("h1::text, h2::text, h3::text, .title::text, .vehicle-title::text").get()
+                      yr = _year(title) or _year(full)
+                      price = _num(full)
+                      miles = _miles(full)
+
+                      itm = {
+                          "title": title or None,
+                          "year": yr,
+                          "price": price,
+                          "mileage": miles,
+                          "vdp_url": vdp_url,
+                          "dealer_id": urlparse(response.url).netloc,
+                          "_provenance": {
+                              "source": response.url,
+                              "robots_obeyed": True,
+                              "note": "SRP only; VDPs fetched only if robots allow (not performed here)."
+                          }
+                      }
+                      if any(itm.get(k) for k in ("title","price","mileage","year")):
+                          items.append(itm)
+
+                  for it in items:
+                      yield it
+
+                  # Pagination (stay on domain and similar path)
+                  next_link = response.css('a[rel="next"]::attr(href), a.next::attr(href), a:has-text("Next")::attr(href)').get()
+                  if next_link:
+                      next_url = urljoin(response.url, next_link)
+                      if urlparse(next_url).netloc == self.host:
+                          yield scrapy.Request(
+                              next_url,
+                              meta={
+                                  "playwright": True,
+                                  "playwright_page_methods": [
+                                      PageMethod("wait_for_load_state", "networkidle"),
+                                      PageMethod("wait_for_selector", "a[href*='vehicle'], a[href*='detail'], [class*='vehicle'], [class*='inventory']", state="attached", timeout=30000),
+                                  ],
+                              },
+                              callback=self.parse_srp
+                          )
+          PY
+
+      - name: Run spider
+        env:
+          START_URL: ${{ github.event.inputs.start_url }}
+        run: |
+          set -o pipefail
+          python - <<'PY' > spider/run.py
+          import os, sys, subprocess
+          url=os.environ["START_URL"]
+          cmd=["python","-m","scrapy","runspider","spider/local_srp.py","-a",f"url={url}"]
+          p=subprocess.run(cmd, capture_output=True, text=True)
+          open("logs/scrapy.log","w").write(p.stdout + "\n--- STDERR ---\n" + p.stderr)
+          sys.exit(0)
+          PY
+          python spider/run.py
+          test -s out/out.ndjson || echo '{}' > out/out.ndjson
+
+      - name: Upload artifacts (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-srp-output
+          path: |
+            out/out.ndjson
+            out/robots.txt
+            out/home.png
+            out/srp_*.png
+            logs/scrapy.log
