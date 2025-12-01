@@ -1,0 +1,138 @@
+name: Scrape VDP
+on:
+  workflow_dispatch:
+    inputs:
+      start_url:
+        description: 'Vehicle Detail Page URL to scrape (must be allowed by robots.txt)'
+        required: true
+        default: 'https://www.echopark.com/car/4T1G11AK2RU191777?store=2128'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (empty ok)
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Scrapy
+        run: |
+          python -m pip install --upgrade pip
+          pip install scrapy==2.11.2
+
+      - name: Write one-file spider (robots-obeying)
+        run: |
+          mkdir -p spider out
+          cat > spider/vdp.py <<'PY'
+          import json, re
+          import scrapy
+          from urllib.parse import urlparse
+
+          def _num(s):
+              if s is None: return None
+              m = re.search(r'[\d,]+(?:\.\d+)?', str(s))
+              return float(m.group(0).replace(',', '')) if m else None
+
+          def _int(s):
+              if s is None: return None
+              m = re.search(r'[\d,]+', str(s))
+              return int(m.group(0).replace(',', '')) if m else None
+
+          class VDPSpider(scrapy.Spider):
+              name = "vdp"
+              custom_settings = {
+                  "ROBOTSTXT_OBEY": True,
+                  "USER_AGENT": "AINCOMP/1.0 (+compliance)",
+                  "DOWNLOAD_DELAY": 0.5,
+                  "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
+                  "LOG_LEVEL": "INFO",
+              }
+
+              def __init__(self, url=None, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  if not url:
+                      raise ValueError("Pass -a url=https://... to start")
+                  self.start_url = url
+
+              def start_requests(self):
+                  yield scrapy.Request(self.start_url, callback=self.parse_vdp)
+
+              def parse_vdp(self, response):
+                  # Prefer JSON-LD
+                  data = {}
+                  for node in response.css('script[type="application/ld+json"]::text').getall():
+                      try:
+                          j = json.loads(node.strip())
+                          candidates = j if isinstance(j, list) else j.get('@graph', [j])
+                          for c in candidates:
+                              t = (c.get('@type') or "")
+                              if isinstance(t, list):
+                                  t = ",".join(t).lower()
+                              else:
+                                  t = str(t).lower()
+                              if 'vehicle' in t or 'product' in t:
+                                  data = c
+                                  break
+                          if data: break
+                      except Exception:
+                          continue
+
+                  title = response.css("title::text").get() or ""
+                  year = None
+                  m = re.search(r'\b(19|20)\d{2}\b', title)
+                  if m: year = int(m.group(0))
+
+                  brand = data.get('brand')
+                  if isinstance(brand, dict):
+                      make = brand.get('name')
+                  else:
+                      make = brand
+
+                  model = data.get('model') or None
+                  vin = data.get('vehicleIdentificationNumber') or None
+
+                  offers = data.get('offers') if isinstance(data.get('offers'), dict) else {}
+                  price = _num(offers.get('price'))
+
+                  odo = data.get('mileageFromOdometer')
+                  mileage = _int(odo.get('value')) if isinstance(odo, dict) else _int(data.get('mileage'))
+
+                  yield {
+                      "vin": vin,
+                      "make": make,
+                      "model": model,
+                      "year": int(data.get('modelDate')) if data.get('modelDate') else year,
+                      "trim": None,  # only set if explicitly present
+                      "price": price,
+                      "mileage": mileage,
+                      "dealer_id": urlparse(response.url).netloc,
+                      "zip": None,
+                      "detail_url": response.url,
+                      "title": title,
+                      "_provenance": {
+                          "source": response.url,
+                          "robots_obeyed": True,
+                          "extraction": "scrapy+jsonld",
+                      }
+                  }
+          PY
+
+      - name: Run spider
+        env:
+          START_URL: ${{ github.event.inputs.start_url }}
+        run: |
+          python -m scrapy runspider spider/vdp.py -a url="$START_URL" -O out/out.jsonl -t jsonlines || true
+          # If robots disallowed, Scrapy won't fetch; we still want an artifact to inspect logs.
+          if [ ! -s out/out.jsonl ]; then
+            echo '{}' > out/out.jsonl
+          fi
+
+      - name: Upload artifact (results)
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-output
+          path: out/out.jsonl
