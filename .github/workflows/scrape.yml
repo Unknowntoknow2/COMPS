@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       start_url:
-        description: 'EchoPark SRP URL under /used-cars/* (robots-allowed)'
+        description: 'EchoPark SRP URL under /used-cars/*'
         required: true
         default: 'https://www.echopark.com/used-cars/'
 
@@ -19,40 +19,41 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps (Scrapy + Playwright)
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install scrapy==2.11.2 scrapy-playwright==0.0.32
 
-      - name: Install Playwright browser
+      - name: Install Playwright Chromium + deps
         run: |
           python -m playwright install --with-deps chromium
 
-      - name: Prepare dirs
+      - name: Prepare workspace
         run: |
           mkdir -p spider out logs
 
-      - name: Fetch robots.txt (for transparency)
-        env: { START_URL: ${{ github.event.inputs.start_url }} }
+      - name: Save robots.txt (for transparency)
+        env:
+          START_URL: ${{ github.event.inputs.start_url }}
         run: |
           python - <<'PY'
           import os, sys
           from urllib.parse import urlparse
           import urllib.request
           url=os.environ["START_URL"]
-          netloc=urlparse(url).netloc
-          robots=f"https://{netloc}/robots.txt"
+          host=urlparse(url).netloc
+          robots=f"https://{host}/robots.txt"
           try:
               with urllib.request.urlopen(robots, timeout=10) as r:
                   b=r.read()
               open("out/robots.txt","wb").write(b)
-              print("robots.txt saved from", robots)
+              print("robots.txt saved:", robots)
           except Exception as e:
               print("robots.txt fetch failed:", e, file=sys.stderr)
               open("out/robots.txt","w").write("FETCH_FAILED")
           PY
 
-      - name: Write SRP spider (JSON-LD + CSS, Playwright render)
+      - name: Write SRP spider (Scrapy + Playwright)
         run: |
           cat > spider/echopark_srp.py <<'PY'
           import re, json
@@ -74,59 +75,65 @@ jobs:
               custom_settings = {
                   "ROBOTSTXT_OBEY": True,
                   "USER_AGENT": "AINCOMP/1.0 (+compliance)",
+                  "LOG_LEVEL": "INFO",
                   "DOWNLOAD_DELAY": 0.5,
                   "CONCURRENT_REQUESTS_PER_DOMAIN": 2,
-                  "LOG_LEVEL": "INFO",
-                  "FEEDS": {"out/out.ndjson": {"format":"jsonlines","overwrite":True}},
+
+                  # Playwright wiring
                   "TWISTED_REACTOR": "twisted.internet.asyncioreactor.AsyncioSelectorReactor",
-                  "DOWNLOADER_MIDDLEWARES": {
-                      "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler": 543,
-                  },
                   "DOWNLOAD_HANDLERS": {
                       "http": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
                       "https": "scrapy_playwright.handler.ScrapyPlaywrightDownloadHandler",
                   },
+                  "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 15000,
+                  "PLAYWRIGHT_LAUNCH_OPTIONS": { "headless": True },
+
+                  # Output
+                  "FEEDS": { "out/out.ndjson": { "format": "jsonlines", "overwrite": True } },
               }
 
               def __init__(self, url=None, *a, **kw):
                   super().__init__(*a, **kw)
                   if not url:
-                      raise ValueError("Provide -a url=https://www.echopark.com/used-cars/... (must be robots-allowed)")
-                  parsed = urlparse(url)
-                  if "/used-cars/" not in parsed.path:
+                      raise ValueError("Provide -a url=https://www.echopark.com/used-cars/... (robots-allowed)")
+                  if "/used-cars/" not in url:
                       raise ValueError("URL must be under /used-cars/* per robots.txt")
                   self.start_url = url
 
               def start_requests(self):
                   yield scrapy.Request(
                       self.start_url,
-                      meta={"playwright": True,
-                            "playwright_page_methods": [
-                                ("wait_for_selector", '[class*="card"], [data-test*="vehicle"], a[href*="/car/"]', {"state":"attached", "timeout": 10000})
-                            ]},
+                      meta={
+                          "playwright": True,
+                          "playwright_page_methods": [
+                              ("wait_for_selector",
+                               '[data-test*="vehicle"], [class*="card"], a[href*="/car/"]',
+                               {"state":"attached", "timeout": 15000})
+                          ],
+                      },
                       callback=self.parse_srp
                   )
 
               def parse_srp(self, response):
-                  # Try to read any embedded JSON for listings first
                   items = []
+                  # SRP vehicle cards (EchoPark is React; we use broad selectors)
+                  cards = response.css(
+                      '[data-test*="vehicle"], [class*="card"], article, li:has(a[href*="/car/"])'
+                  )
 
-                  # Fallback to CSS cards
-                  cards = response.css('[data-test*="vehicle"], [class*="card"], article, li:has(a[href*="/car/"])')
                   for c in cards:
                       title = c.css('h2::text, h3::text, .title::text, [data-test*="title"]::text').get()
-                      price_t = c.css('[class*="price"]::text,[data-test*="price"]::text, [aria-label*="Price"]::text').get()
-                      mileage_t = c.css('[class*="mile"]::text,[data-test*="mile"]::text, li:contains("mile")::text').get()
-                      link = c.css('a[href*="/car/"]::attr(href)').get()
-                      # Respect robots: we are on SRP (allowed). The VDPs (/car/*) are disallowed, so don't fetch them.
-                      vdp_url = urljoin(response.url, link) if link else None
+                      price_t = c.css('[class*="price"]::text, [data-test*="price"]::text, [aria-label*="Price"]::text').get()
+                      mileage_t = c.css('[class*="mile"]::text, [data-test*="mile"]::text, li:contains("mile")::text').get()
+                      href = c.css('a[href*="/car/"]::attr(href)').get()
+                      vdp_url = urljoin(response.url, href) if href else None  # NOTE: do NOT fetch VDPs (/car/* disallowed)
 
                       year = None
                       if title:
                           m = re.search(r'\b(19|20)\d{2}\b', title)
                           if m: year = int(m.group(0))
 
-                      item = {
+                      itm = {
                           "title": title,
                           "year": year,
                           "price": _num(price_t),
@@ -136,33 +143,35 @@ jobs:
                           "_provenance": {
                               "source": response.url,
                               "robots_obeyed": True,
-                              "note": "VDPs under /car/* are disallowed; not fetched."
+                              "note": "VDPs under /car/* are disallowed and not fetched."
                           }
                       }
-                      # Skip empty cards
-                      if any(item.get(k) for k in ("title","price","mileage","vdp_url")):
-                          items.append(item)
+                      if any(itm.get(k) for k in ("title","price","mileage","vdp_url","year")):
+                          items.append(itm)
 
-                  # Yield all found items
                   for it in items:
                       yield it
 
-                  # Handle pagination within /used-cars/* only
+                  # Pagination inside /used-cars/*
                   next_href = response.css('a[rel="next"]::attr(href), a:contains("Next")::attr(href)').get()
                   if next_href:
                       next_url = urljoin(response.url, next_href)
                       if "/used-cars/" in urlparse(next_url).path:
                           yield scrapy.Request(
                               next_url,
-                              meta={"playwright": True,
-                                    "playwright_page_methods": [
-                                        ("wait_for_selector", '[class*="card"], [data-test*="vehicle"], a[href*="/car/"]', {"state":"attached", "timeout": 10000})
-                                    ]},
+                              meta={
+                                  "playwright": True,
+                                  "playwright_page_methods": [
+                                      ("wait_for_selector",
+                                       '[data-test*="vehicle"], [class*="card"], a[href*="/car/"]',
+                                       {"state":"attached", "timeout": 15000})
+                                  ],
+                              },
                               callback=self.parse_srp
                           )
           PY
 
-      - name: Run spider (Playwright render)
+      - name: Run spider
         env:
           START_URL: ${{ github.event.inputs.start_url }}
         run: |
@@ -170,7 +179,8 @@ jobs:
           python -m scrapy runspider spider/echopark_srp.py -a url="$START_URL" 2>&1 | tee logs/scrapy.log || true
           test -s out/out.ndjson || echo '{}' > out/out.ndjson
 
-      - name: Upload artifacts
+      - name: Upload artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: echopark-srp-output
