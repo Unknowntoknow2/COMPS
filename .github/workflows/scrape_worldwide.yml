@@ -1,12 +1,16 @@
-name: Scrape Local Dealer via Sitemap (robots-allowed)
+name: Scrape Local Dealer via Sitemap + Nav (robots-allowed)
 
 on:
   workflow_dispatch:
     inputs:
       start_url:
-        description: 'Dealer homepage (same domain as sitemap)'
+        description: 'Dealer homepage'
         required: true
         default: 'https://www.worldwideautosalesca.com/'
+      srp_url:
+        description: 'Optional: known SRP URL on same domain (skips discovery)'
+        required: false
+        default: ''
 
 jobs:
   run:
@@ -50,16 +54,17 @@ jobs:
             echo "FETCH_FAILED" > out/robots.txt
           fi
 
-      - name: Write spider (sitemap→SRP→extract)
+      - name: Write spider (sitemap + nav discovery; optional SRP override)
         run: |
           cat > spider/dealer_srp.py <<'PY'
-          import re, scrapy, io
+          import re, io, json, scrapy
           from urllib.parse import urlparse, urljoin
           from scrapy_playwright.page import PageMethod
           from lxml import etree
 
-          SRP_HINTS = ("inventory","used","pre-owned","preowned","search","vehicles","browse","listings","stock")
-          VDP_HINTS = ("/vehicle", "vehicle-details", "viewdetails", "vdp", "vin=")
+          SRP_TEXT_RE = re.compile(r'(inventory|used|pre[-\s]?owned|search\s+inventory|browse\s+vehicles|view\s+inventory|shop\s+cars)', re.I)
+          SRP_HINTS   = ("inventory","used","pre-owned","preowned","search","vehicles","browse","listings","stock")
+          VDP_HINTS   = ("vehicle", "vehicle-details", "viewdetails", "vdp", "vin=", "AutoDetails", "details")
 
           def _num(s):
               if not s: return None
@@ -81,7 +86,7 @@ jobs:
               m=re.search(r'\b[A-HJ-NPR-Z0-9]{17}\b', s)
               return m.group(0) if m else None
 
-          class DealerSRP(scrapy.Spider):
+          class DealerSRP(spycracker := scrapy.Spider):
               name = "dealer_srp"
               custom_settings = {
                   "ROBOTSTXT_OBEY": True,
@@ -99,14 +104,15 @@ jobs:
                   "FEEDS": { "out/out.ndjson": { "format": "jsonlines", "overwrite": True } },
               }
 
-              def __init__(self, url=None, *a, **kw):
+              def __init__(self, url=None, srp=None, *a, **kw):
                   super().__init__(*a, **kw)
                   if not url: raise ValueError("Provide -a url=https://dealer/")
                   self.start_url = url
+                  self.srp_override = srp or ""
                   self.host = urlparse(url).netloc
+                  self.found_links = []
 
               def start_requests(self):
-                  # 1) Load homepage for screenshot (optional)
                   yield scrapy.Request(
                       self.start_url,
                       meta={
@@ -120,65 +126,102 @@ jobs:
                   )
 
               def after_home(self, response):
-                  # 2) Fetch sitemap.xml → pick SRP-like URLs
+                  # If SRP override provided, use it directly
+                  if self.srp_override:
+                      u = self.srp_override
+                      if urlparse(u).netloc != self.host:
+                          self.logger.info("SRP override not same domain, ignoring: %s", u)
+                      else:
+                          yield from self.fetch_srp(u, idx="override")
+                          return
+
+                  # 1) Parse sitemap
                   sm_url = urljoin(response.url, "/sitemap.xml")
                   yield scrapy.Request(sm_url, callback=self.parse_sitemap, dont_filter=True)
 
+                  # 2) Discover via nav/menu text on homepage
+                  anchors = response.css("a")
+                  for a in anchors:
+                      text = " ".join((a.css("::text").get() or "").split())
+                      href = a.css("::attr(href)").get()
+                      if not href: continue
+                      if not SRP_TEXT_RE.search(text): continue
+                      u = urljoin(response.url, href)
+                      p = urlparse(u)
+                      if p.netloc != self.host: continue
+                      path = p.path.lower()
+                      if any(h in path for h in SRP_HINTS) and not any(v in path for v in VDP_HINTS):
+                          self.found_links.append({"source":"nav", "text":text, "url":u})
+
+                  # 3) If nothing from sitemap later, we'll fall back to common guesses:
+                  for g in ["/inventory","/used-vehicles","/used","/pre-owned","/inventory/used","/cars-for-sale","/search-inventory"]:
+                      u = urljoin(f"https://{self.host}", g)
+                      self.found_links.append({"source":"guess", "text":g, "url":u})
+
               def parse_sitemap(self, response):
+                  # collect SRP-like URLs
                   urls=[]
                   try:
                       tree=etree.parse(io.BytesIO(response.body))
                       for loc in tree.xpath("//*[local-name()='loc']/text()"):
-                          p=urlparse(loc)
+                          p=urlparse(loc); path=p.path.lower()
                           if p.netloc != self.host: continue
-                          path=p.path.lower()
                           if any(h in path for h in SRP_HINTS) and not any(v in path for v in VDP_HINTS):
                               urls.append(loc)
                   except Exception:
-                      # fallback: regex find URLs in body
-                      body=response.text
-                      for m in re.finditer(r'<loc>(.*?)</loc>', body, re.I|re.M):
+                      # fallback regex
+                      for m in re.finditer(r'<loc>(.*?)</loc>', response.text, re.I|re.M):
                           loc=m.group(1).strip()
-                          p=urlparse(loc)
+                          p=urlparse(loc); path=p.path.lower()
                           if p.netloc != self.host: continue
-                          path=p.path.lower()
                           if any(h in path for h in SRP_HINTS) and not any(v in path for v in VDP_HINTS):
                               urls.append(loc)
 
-                  # Dedup and cap to 5 SRPs
-                  seen=set()
-                  srps=[u for u in urls if not (u in seen or seen.add(u))][:5]
-                  if not srps:
-                      # If none in sitemap, try common SRP paths
-                      guesses = [
-                        "/inventory", "/used-vehicles", "/used", "/pre-owned", "/search", "/vehicles", "/inventory/used"
-                      ]
-                      base=f"https://{self.host}"
-                      srps=[urljoin(base,g) for g in guesses]
+                  for u in urls:
+                      self.found_links.append({"source":"sitemap", "text":"", "url":u})
 
-                  for i,u in enumerate(srps):
-                      yield scrapy.Request(
-                          u,
-                          meta={
-                              "playwright": True,
-                              "playwright_page_methods": [
-                                  PageMethod("wait_for_load_state", "networkidle"),
-                                  PageMethod("wait_for_selector", "a, [class*='vehicle'], [class*='inventory']", state="attached", timeout=30000),
-                                  PageMethod("screenshot", path=f"out/srp_{i}.png", full_page=True),
-                              ],
-                          },
-                          callback=self.parse_srp
-                      )
+                  # Deduplicate, prefer sitemap/nav over guesses
+                  seen=set()
+                  ordered=[]
+                  for entry in self.found_links:
+                      u=entry["url"]
+                      if u in seen: continue
+                      seen.add(u); ordered.append(entry)
+
+                  # Save discovered links artifact
+                  with open("out/found_links.json","w") as f:
+                      json.dump(ordered, f, indent=2)
+
+                  # Take first up to 5 candidates and fetch
+                  count=0
+                  for entry in ordered:
+                      if count>=5: break
+                      yield from self.fetch_srp(entry["url"], idx=str(count))
+                      count+=1
+
+              def fetch_srp(self, url, idx="x"):
+                  yield scrapy.Request(
+                      url,
+                      meta={
+                          "playwright": True,
+                          "playwright_page_methods": [
+                              PageMethod("wait_for_load_state", "networkidle"),
+                              PageMethod("wait_for_selector",
+                                         "a, [class*='vehicle'], [class*='inventory'], [class*='listing']",
+                                         state="attached", timeout=30000),
+                              PageMethod("screenshot", path=f"out/srp_{idx}.png", full_page=True),
+                          ],
+                      },
+                      callback=self.parse_srp
+                  )
 
               def parse_srp(self, response):
-                  cards = response.css("[class*='vehicle'], [class*='inventory'], article, li, .card, .vehicle, .listing")
+                  cards = response.css("[class*='vehicle'], [class*='inventory'], [class*='listing'], article, li, .card, .vehicle, .listing")
                   for c in cards:
                       href = c.css("a::attr(href)").get() or ""
-                      if any(v in href.lower() for v in VDP_HINTS):
-                          vdp_url=urljoin(response.url, href)
-                      else:
-                          # keep only likely VDP links
+                      if not any(v in href.lower() for v in VDP_HINTS):
                           continue
+                      vdp_url = urljoin(response.url, href)
 
                       texts = c.css("*::text, ::text").getall()
                       full = " ".join(t.strip() for t in texts if t and t.strip())
@@ -196,7 +239,7 @@ jobs:
                           "price": price,
                           "mileage": miles,
                           "vin": vin,
-                          "vdp_url": vdp_url,  # not fetched; recorded for humans
+                          "vdp_url": vdp_url,  # not fetched here; recorded for humans
                           "dealer_id": urlparse(response.url).netloc,
                           "_provenance": {
                               "source": response.url,
@@ -204,40 +247,27 @@ jobs:
                               "note": "SRP only; VDPs not fetched."
                           }
                       }
-
-                  # Pagination: look for next links within same domain
-                  next_href = response.css('a[rel="next"]::attr(href), a.next::attr(href)').get()
-                  if next_href:
-                      nxt=urljoin(response.url, next_href)
-                      if urlparse(nxt).netloc == self.host:
-                          yield scrapy.Request(
-                              nxt,
-                              meta={
-                                  "playwright": True,
-                                  "playwright_page_methods": [
-                                      PageMethod("wait_for_load_state", "networkidle"),
-                                      PageMethod("wait_for_selector", "a, [class*='vehicle'], [class*='inventory']", state="attached", timeout=30000),
-                                  ],
-                              },
-                              callback=self.parse_srp
-                          )
           PY
 
       - name: Run spider
         env:
           START_URL: ${{ github.event.inputs.start_url }}
+          SRP_URL: ${{ github.event.inputs.srp_url }}
         run: |
           set -o pipefail
           python - <<'PY' > spider/run.py
           import os, sys, subprocess
           url=os.environ["START_URL"]
+          srp=os.environ.get("SRP_URL","")
           cmd=["python","-m","scrapy","runspider","spider/dealer_srp.py","-a",f"url={url}"]
+          if srp: cmd += ["-a", f"srp={srp}"]
           p=subprocess.run(cmd, capture_output=True, text=True)
           open("logs/scrapy.log","w").write(p.stdout + "\n--- STDERR ---\n" + p.stderr)
           sys.exit(0)
           PY
           python spider/run.py
           test -s out/out.ndjson || echo '{}' > out/out.ndjson
+          test -s out/found_links.json || echo '[]' > out/found_links.json
 
       - name: Upload artifacts (always)
         if: always()
@@ -249,4 +279,5 @@ jobs:
             out/robots.txt
             out/home.png
             out/srp_*.png
+            out/found_links.json
             logs/scrapy.log
