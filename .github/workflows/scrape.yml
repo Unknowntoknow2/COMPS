@@ -26,7 +26,7 @@ jobs:
       - name: Verify project structure
         run: |
           echo "Current directory: $(pwd)"
-          echo "Listing files recursively..."
+          echo "Listing files recursively:"
           ls -R
 
       - name: Set up Python
@@ -44,10 +44,15 @@ jobs:
       - name: Run Scraper and Upload to Supabase
         run: |
           echo "Starting Craigslist scrape job..."
-          export PYTHONPATH=$PYTHONPATH:$(pwd)
-          echo "PYTHONPATH set to: $PYTHONPATH"
+
+          # Ensure proper project root and module path
+          export PYTHONPATH=$(pwd)
+          export SCRAPY_PROJECT_DIR=$(pwd)
+          echo "PYTHONPATH: $PYTHONPATH"
+          echo "SCRAPY_PROJECT_DIR: $SCRAPY_PROJECT_DIR"
 
           mkdir -p data logs
+
           echo "Verifying spider availability..."
           scrapy list || echo "No spiders detected!"
 
