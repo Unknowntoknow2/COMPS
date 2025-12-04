@@ -26,7 +26,7 @@ jobs:
       - name: Verify project structure
         run: |
           echo "Current directory: $(pwd)"
-          echo "Listing files:"
+          echo "Listing files recursively..."
           ls -R
 
       - name: Set up Python
@@ -44,19 +44,22 @@ jobs:
       - name: Run Scraper and Upload to Supabase
         run: |
           echo "Starting Craigslist scrape job..."
+          export PYTHONPATH=$PYTHONPATH:$(pwd)
+          echo "PYTHONPATH set to: $PYTHONPATH"
+
           mkdir -p data logs
-          cd app || cd src || true  # adjust automatically if your scrapy project lives under app/
-          ls
+          echo "Verifying spider availability..."
           scrapy list || echo "No spiders detected!"
+
+          echo "Running spider..."
           scrapy crawl craigslist_cars \
             -a city=sfbay \
             -a query="honda civic" \
             -a limit=10 \
-            -s LOG_FILE=../logs/scrapy.log \
+            -s LOG_FILE=logs/scrapy.log \
             -s LOG_LEVEL=INFO || true
-          echo "Scraping complete. Checking output..."
 
-          cd ..
+          echo "Scraping complete. Checking for output..."
           if [ ! -f data/output.jsonl ]; then
             echo "No output file found. Creating placeholder..."
             echo "{}" > data/output.jsonl
