@@ -25,3 +25,14 @@ class ProxyRotationMiddleware:
         proxy = random.choice(self.proxies)
         request.meta["proxy"] = proxy
         spider.logger.debug(f"Using proxy: {proxy}")
+
+
+# ----- Proxy Rotation Middleware -----
+DOWNLOADER_MIDDLEWARES.update({
+    "app.middlewares.ProxyRotationMiddleware": 410,
+})
+
+# Retry and timeout tuning for unstable proxies
+RETRY_ENABLED = True
+RETRY_TIMES = 3
+DOWNLOAD_TIMEOUT = 20
