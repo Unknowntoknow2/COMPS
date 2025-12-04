@@ -13,11 +13,14 @@ jobs:
       PROXY_POOL: ${{ secrets.PROXY_POOL }}
       POSTGRES_DSN: ${{ secrets.POSTGRES_DSN }}
       S3_BUCKET: vehicle_photos
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_SECRET_KEY: ${{ secrets.S3_SECRET_KEY }}
+      S3_ENDPOINT_URL: https://xltxqqzattxogxtqrggt.supabase.co/storage/v1/s3
       ANON_HMAC_SECRET: ${{ secrets.ANON_HMAC_SECRET }}
       LOG_LEVEL: INFO
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -27,14 +30,18 @@ jobs:
 
       - name: Install dependencies
         run: |
+          pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium --with-deps
 
-      - name: Run Scraper
+      - name: Run Scraper and Upload to Supabase
         run: |
-          scrapy crawl craigslist_cars -a city=sfbay -a query="honda civic" -a limit=10
+          echo "Starting Craigslist scrape job..."
+          mkdir -p data
+          scrapy crawl craigslist_cars -a city=sfbay -a query="honda civic" -a limit=10 -s LOG_LEVEL=INFO
+          echo "Scraping complete."
 
-      - name: Upload results
+      - name: Upload results as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
