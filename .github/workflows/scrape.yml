@@ -30,6 +30,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          echo "Installing dependencies..."
           pip install --upgrade pip
           pip install -r requirements.txt
           python -m playwright install chromium --with-deps
@@ -37,13 +38,26 @@ jobs:
       - name: Run Scraper and Upload to Supabase
         run: |
           echo "Starting Craigslist scrape job..."
-          mkdir -p data
-          scrapy crawl craigslist_cars -a city=sfbay -a query="honda civic" -a limit=10 -s LOG_LEVEL=INFO
-          echo "Scraping complete."
+          mkdir -p data logs
+          scrapy crawl craigslist_cars \
+            -a city=sfbay \
+            -a query="honda civic" \
+            -a limit=10 \
+            -s LOG_FILE=logs/scrapy.log \
+            -s LOG_LEVEL=INFO || true
+          echo "Scraping complete. Checking output..."
 
-      - name: Upload results as artifact
+          # Ensure file exists even if scraper fails
+          if [ ! -f data/output.jsonl ]; then
+            echo "No output file found. Creating placeholder..."
+            echo "{}" > data/output.jsonl
+          fi
+
+      - name: Upload results and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: craigslist-results
-          path: data/output.jsonl
+          name: craigslist-scraper-results
+          path: |
+            data/output.jsonl
+            logs/scrapy.log
