@@ -23,6 +23,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Verify project structure
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Listing files:"
+          ls -R
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -32,22 +38,25 @@ jobs:
         run: |
           echo "Installing dependencies..."
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install scrapy scrapy-playwright playwright boto3 psycopg2-binary python-dotenv
           python -m playwright install chromium --with-deps
 
       - name: Run Scraper and Upload to Supabase
         run: |
           echo "Starting Craigslist scrape job..."
           mkdir -p data logs
+          cd app || cd src || true  # adjust automatically if your scrapy project lives under app/
+          ls
+          scrapy list || echo "No spiders detected!"
           scrapy crawl craigslist_cars \
             -a city=sfbay \
             -a query="honda civic" \
             -a limit=10 \
-            -s LOG_FILE=logs/scrapy.log \
+            -s LOG_FILE=../logs/scrapy.log \
             -s LOG_LEVEL=INFO || true
           echo "Scraping complete. Checking output..."
 
-          # Ensure file exists even if scraper fails
+          cd ..
           if [ ! -f data/output.jsonl ]; then
             echo "No output file found. Creating placeholder..."
             echo "{}" > data/output.jsonl
